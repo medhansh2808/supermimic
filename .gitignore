@@ -1,0 +1,23 @@
+# Local environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.uv-cache/
+.DS_Store
+.vscode/
+# GPU outputs: never commit checkpoints, raw data, or derived media
+logs/
+checkpoints/
+artifacts/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.mp4
+*.gif
+*.webm
+# Local secrets / variable config overrides
+.env
+.env.*
+# Keep exported small CSV/JSON results, docs and scripts tracked.
