@@ -17,6 +17,7 @@ artifacts/
 *.mp4
 *.gif
 *.webm
+*_console.log
 # Local secrets / variable config overrides
 .env
 .env.*
