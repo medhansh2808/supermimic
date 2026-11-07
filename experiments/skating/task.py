@@ -75,8 +75,21 @@ class SkateMDP(MDP):
         return (track - penalties) * CONTROL_DT
 
     def reward(self, S, f, a, a_prev, terms=False, **kwargs):
+        # Simulator-only checks: stop before invalid states enter returns or replay.
+        # Imagined rewards (terms=False) keep their differentiable compiled path.
+        if terms:
+            for name, value in zip(("p", "R", "v", "w", "q", "qd", "action", "previous_action"),
+                                   (*S, a, a_prev)):
+                if not torch.isfinite(value).all():
+                    bad = (~torch.isfinite(value)).nonzero()[:8].detach().cpu().tolist()
+                    raise FloatingPointError(
+                        f"Skating simulator: non-finite {name}, indices={bad}; "
+                        "stopping before return/replay contamination")
         command = self.motion.commands[self.motion.clip_id[f]]
         r = self.reward_command(S, command, a, a_prev)
+        if terms and not torch.isfinite(r).all():
+            bad = (~torch.isfinite(r)).nonzero()[:8].detach().cpu().tolist()
+            raise FloatingPointError(f"Skating simulator: non-finite reward, indices={bad}")
         if terms:
             speed, yaw, tilt, contact, glide, vf = self.components(S, command)
             return r, dict(speed_error_mps=speed.sqrt(), yaw_error_radps=yaw.sqrt(), glide=glide)

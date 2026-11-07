@@ -34,12 +34,12 @@ for MODE in "${MODES[@]}"; do
     --source "$SOURCE" --mode "$MODE" --log_dir "$SMOKE" \
     --iterations 2 --wm_warmup 1 --commands 4 --num_envs 16 \
     --pi_batch 8 --wm_batch 8 --wm_batches 1 --buffer_steps 80 --warmup_steps 40 \
-    --pi_ema .995 --log_every 1 --ckpt_minutes 0 \
+    --amp none --lr 5e-5 --pi_ema .995 --log_every 1 --ckpt_minutes 0 \
     2>&1 | tee "$OUT/smoke_${MODE}.log"
   bash scripts/wm_python.sh -m experiments.skating.train \
     --source "$SOURCE" --mode "$MODE" --log_dir "$RUN" \
     --commands 128 --command_seed 2100 --seed 0 --max_hours "$HOURS" \
-    --num_envs 1024 --pi_batch 512 --horizon 32 --pi_ema .995 --ckpt_minutes 10 \
+    --num_envs 1024 --pi_batch 512 --horizon 32 --amp none --lr 5e-5 --pi_ema .995 --ckpt_minutes 2 \
     2>&1 | tee "$OUT/train_${MODE}.log"
   bash scripts/wm_python.sh -m experiments.skating.evaluate --ckpt "$RUN/last.pt" \
     --suite commands --seconds 20 --output "$OUT/${MODE}_commands.json" --record \
