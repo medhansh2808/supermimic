@@ -10,7 +10,7 @@ On the 4090, run:
 bash scripts/skate_motion_check.sh
 ```
 
-Output is written to `artifacts/skate_motion_check_v1/`: `report.json`, one NPZ trajectory and MP4 per selected clip. The default is ten seconds per clip, up to three clips. The script preserves existing output directories and does not start training.
+Output is written to `artifacts/skate_motion_check_v2/`: `report.json`, one NPZ trajectory and MP4 per selected clip. The default is ten seconds per clip, up to three clips. The script preserves existing output directories and does not start training.
 
 To choose a different full motion-tracking checkpoint or output directory, pass absolute paths:
 

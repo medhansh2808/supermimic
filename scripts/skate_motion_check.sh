@@ -2,7 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE="${1:-$ROOT/third_party/instantTrack/logs/baseline_ema_s0/ckpt_009931.pt}"
-OUT="${2:-$ROOT/artifacts/skate_motion_check_v1}"
+OUT="${2:-$ROOT/artifacts/skate_motion_check_v2}"
 [[ -f "$SOURCE" ]] || { echo "Checkpoint not found: $SOURCE" >&2; exit 1; }
 SOURCE="$(realpath "$SOURCE")"
 OUT="$(realpath -m "$OUT")"
@@ -13,7 +13,7 @@ export MUJOCO_GL=egl
 
 bash "$ROOT/scripts/wm_python.sh" -m experiments.skating.evaluate_motion \
   --ckpt "$SOURCE" --output_dir "$OUT" --clip_regex walk --max_clips 3 --seconds 10 \
-  2>&1 | tee "$ROOT/artifacts/skate_motion_check_v1_console.log"
+  2>&1 | tee "$ROOT/artifacts/skate_motion_check_v2_console.log"
 
 for INPUT in "$OUT"/motion_*.npz; do
   STEM="${INPUT%.npz}"

@@ -77,7 +77,11 @@ def run_clip(env, pi, motion, clip_id: int, seconds: float, hist_len: int, goal_
         if did_fail:
             fail_step = t + 1
             break
-        env.f = torch.minimum(env.f, motion.clip_end - 1)
+        # This simulator has one environment while MotionLib contains every clip.
+        # Clamp against this selected clip only: using the full clip_end vector
+        # broadcasts env.f from shape [1] to [num_clips] on the next observation.
+        clip_last_frame = motion.clip_end[clip_id].expand_as(env.f) - 1
+        env.f = torch.minimum(env.f, clip_last_frame)
 
     if not states:
         raise RuntimeError(f"No valid frames recorded for {motion.names[clip_id]}")
