@@ -101,6 +101,7 @@ def main():
                 speed = float(np.linalg.norm(s[7:9]))
                 draw.text((18, 10), f"Blade-contact simulation | {mode} | trial {args.trial} | {frame * .02:.1f}s", font=font, fill="white")
                 label = (f"Standing balance | {str(data['trial_name'][args.trial])}" if suite == "balance" else
+                         f"Pretrained motion | {str(data['trial_name'][args.trial])}" if suite == "motion" else
                          "Straight skating" if suite == "straight" else f"Gates {passed}/3" if suite == "course" else
                          ["Forward", "Left turn", "Right turn", "Accelerate then brake"][args.trial])
                 draw.text((18, 42), f"{label} | speed {speed:.2f} m/s | fixed camera", font=font, fill="white")
