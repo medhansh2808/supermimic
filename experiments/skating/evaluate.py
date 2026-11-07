@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--device", choices=["cpu", "cuda:0"], default="cuda:0")
     parser.add_argument("--reference", action="store_true")
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--command_speed", type=float, default=None,
+                         help="Evaluation-only straight target speed override in m/s")
     args = parser.parse_args()
     if args.reference and args.live:
         parser.error("Choose reference or live, not both")
@@ -74,6 +76,12 @@ def main():
     straight = speed is not None
     if straight != (args.suite == "straight"):
         raise ValueError("Straight checkpoints require --suite straight; other checkpoints require their original suites")
+    if args.command_speed is not None:
+        if not straight:
+            parser.error("--command_speed is only available for straight skating checkpoints")
+        if not 0 < args.command_speed <= .6:
+            parser.error("--command_speed must be in (0, .6] m/s")
+        speed = args.command_speed
     robot = skate_robot()
     install_scene()
     kin = Kinematics(robot, dev)
@@ -221,7 +229,9 @@ def main():
                          completion_s=float(finish_time[i]) if torch.isfinite(finish_time[i]) else None))
     result = dict(checkpoint=str(Path(args.ckpt).resolve()), suite=args.suite, seconds=args.seconds,
                   seed=args.seed, mode=ck["task"]["mode"], trials=rows,
-                  target_speed_mps=speed, policy_weights=policy_weights,
+                  target_speed_mps=speed, checkpoint_training_speed_mps=ck["task"].get("straight_speed"),
+                  evaluation_only_speed_override=(args.command_speed is not None),
+                  policy_weights=policy_weights,
                   completion_definition=("no falls; +x displacement >= half target-speed distance; lateral drift <.5m; final 5s mean world velocity error <.15m/s"
                                          if straight else "cross all 3 gate planes forward within .6m of centre, then within .75m of finish at <.12m/s for 2s; no falls"
                                          if args.suite == "course" else "no falls and mean planar velocity error <.25m/s"),
