@@ -79,7 +79,20 @@ def main():
     parser.add_argument("--critic_warmup_updates", type=int, default=200)
     parser.add_argument("--critic_target_tau", type=float, default=.01)
     parser.add_argument("--bounded_critic", action="store_true")
+    parser.add_argument("--calibrated_critic", default=None)
+    parser.add_argument("--action_delta", type=float, default=.25)
+    parser.add_argument("--controlled_updates", type=int, default=200)
     args, training_args = parser.parse_known_args()
+    controlled = args.calibrated_critic is not None
+    if controlled:
+        if args.mode != "finetune_wm" or args.straight_speed != .35 or not args.freeze_decoder or args.stable_critic or "--no_critic" in training_args:
+            parser.error("Controlled test requires .35 m/s, --freeze_decoder, and an enabled fixed calibrated critic")
+        if args.controlled_updates < 1 or not 0 < args.action_delta <= 1:
+            parser.error("Invalid controlled-update count or action limit")
+        for flag in ("--iterations", "--action_noise", "--imag_action_noise", "--wm_only_iters", "--demo_replay", "--anchored"):
+            if flag in training_args:
+                parser.error(f"{flag} is set by the controlled protocol")
+        args.calibrated_critic = str(Path(args.calibrated_critic).resolve())
     if args.bounded_critic and not args.stable_critic:
         parser.error("--bounded_critic requires --stable_critic")
     if args.stable_critic:
@@ -130,8 +143,22 @@ def main():
                 critic_target_tau=args.critic_target_tau if args.stable_critic else None,
                 long_friction=.025, side_friction=1.2, seconds=12,
                 protocol="same pretrained decoder in every mode; policy learns velocity commands on passive blade contacts")
+    if controlled:
+        from experiments.wm_control.common import file_hash, load_checkpoint
+        calibration = load_checkpoint(args.calibrated_critic, device="cpu")
+        if calibration.get("kind") != "bounded" or calibration["metadata"]["source_sha256"] != file_hash(args.source):
+            raise ValueError("Calibrated bounded critic must match the ORIGINAL source checkpoint")
+        if calibration["metadata"].get("speed_reward_target") != .35:
+            raise ValueError("Critic calibration reward differs")
+        task.update(critic_protocol="frozen_real_return_calibration", critic_frozen=True, randomized=False,
+                    controlled_action_delta=args.action_delta, controlled_updates=args.controlled_updates,
+                    calibrated_critic_sha256=file_hash(args.calibrated_critic))
+        training_args += ["--iterations", str(args.wm_warmup + args.controlled_updates), "--action_noise", "0"]
     training_args += ["--wm_only_iters", "0" if args.mode == "frozen_wm" else str(args.wm_warmup)]
     source = training_source((UPSTREAM / "src/instanttrack/train.py").read_text(), args.mode == "frozen_wm", args.diagnose)
+    if controlled:
+        from .controlled_policy import patch_controlled
+        source = patch_controlled(source, patch_once)
     if args.stable_critic:
         from .actor_critic import patch_actor_critic
         source = patch_actor_critic(source, patch_once, bounded=args.bounded_critic)
@@ -140,6 +167,25 @@ def main():
         initialize(ns, args.source, args.mode, task)
         if args.freeze_decoder:
             freeze_controller(ns["pi"])
+        if controlled:
+            import copy
+            if ns["pipe"].stateful:
+                raise ValueError("Controlled protocol currently requires the stateless G1 observation pipeline")
+            from .controlled_policy import limit_policy
+            if abs(calibration["metadata"]["gamma"] - ns["args"].gamma) > 1e-10:
+                raise ValueError("Calibrated critic discount differs")
+            if calibration["in_dim"] != ns["CRITIC_IN"]:
+                raise ValueError("Calibrated critic feature layout differs")
+            ns["critic"].load_state_dict(calibration["critic"])
+            ns["critic"].requires_grad_(False)
+            ns["critic"].norm.update = lambda x: None
+            ns["pi"].goal_norm.update = lambda x: None
+            reference = copy.deepcopy(ns["pi"]).eval().requires_grad_(False)
+            ns["_reference_pi"] = reference
+            limit_policy(ns["pi"], reference, args.action_delta)
+            if ns["pi_avg"] is not None:
+                limit_policy(ns["pi_avg"].module, reference, args.action_delta)
+            print("Loaded fixed real-return critic; bounded action changes:", args.action_delta, flush=True)
     sys.argv = [str(UPSTREAM / "src/instanttrack/train.py"), *training_args]
     g = dict(__name__="__main__", __file__=str(UPSTREAM / "src/instanttrack/train.py"),
              _task_metadata=task, _transfer_init=transfer_init,

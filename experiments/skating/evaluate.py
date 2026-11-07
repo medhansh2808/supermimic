@@ -56,7 +56,11 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--record", action="store_true")
     parser.add_argument("--device", choices=["cpu", "cuda:0"], default="cuda:0")
+    parser.add_argument("--reference", action="store_true")
+    parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
+    if args.reference and args.live:
+        parser.error("Choose reference or live, not both")
     if args.seconds < 10:
         parser.error("Evaluate for at least 10 seconds")
     check_upstream()
@@ -77,7 +81,18 @@ def main():
     motion = make_library(robot, kin, dev, count=n, seed=args.seed, seconds=math.ceil(args.seconds) + 2)
     mdp = (StraightSkateMDP if straight else SkateMDP)(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     pi = build_policy(ck, mdp, 3, robot, dev)
-    pi.load_state_dict(ck["pi"])
+    if args.reference:
+        if "reference_pi" not in ck:
+            raise ValueError("Checkpoint has no controlled reference")
+        pi.load_state_dict(ck["reference_pi"])
+    else:
+        pi.load_state_dict(ck["pi_live"] if args.live else ck["pi"])
+    if "reference_pi" in ck and not args.reference:
+        from .controlled_policy import limit_policy
+        reference = build_policy(ck, mdp, 3, robot, dev)
+        reference.load_state_dict(ck["reference_pi"])
+        limit_policy(pi, reference, ck["task"]["controlled_action_delta"])
+    policy_weights = "reference" if args.reference else "live" if args.live else "ema"
     pi.eval()
     env = TrackingSim(make_sim(robot), n, robot, motion, mdp, dev, eval_mode=True, randomize=False)
     env.reset(torch.arange(n, device=dev), motion.clip_start.clone())
@@ -94,6 +109,11 @@ def main():
         commands[:] = torch.tensor([speed, 0., 0.], device=dev)
     start_position = env.state()[0].clone()
     positions = []
+    velocities = []
+    tilts = []
+    discounted_return = torch.zeros(n, device=dev)
+    total_return = torch.zeros(n, device=dev)
+    alive_steps = torch.zeros(n, device=dev)
     world_speed_errors = []
     history = None
     errors, glides, support, moving = [], [], [], []
@@ -122,7 +142,11 @@ def main():
             cmd_frames.append(command.cpu())
             terminated.append(failed.cpu().clone())
         was_alive = ~failed
-        env.step(action)
+        transition = env.step(action)
+        reward = torch.where(was_alive & torch.isfinite(transition["r"]), transition["r"], 0.)
+        discounted_return += ck["args"].get("gamma", .99)**step * reward
+        total_return += reward
+        alive_steps += was_alive
         S1 = env.state()
         flat = flatten_state(S1)
         finite = torch.isfinite(flat).all(-1)
@@ -130,6 +154,8 @@ def main():
         failed |= env.failed_eval | ~finite
         last_finite = torch.where((finite & was_alive)[:, None], flat, last_finite)
         positions.append(S1[0].detach().cpu())
+        velocities.append(S1[2].detach().cpu())
+        tilts.append(torch.rad2deg(torch.acos(S1[1][:, 2, 2].clamp(-1, 1))).cpu())
         world_speed_errors.append((S1[2][:, :2] - command[:, :2]).norm(dim=-1).detach().cpu())
         speed_error, _, _, contact, glide, _ = mdp.components(S1, command)
         if straight:
@@ -171,6 +197,7 @@ def main():
     dx = position_trace[-1, :, 0] - start_position[:, 0].cpu()
     lane_error = (position_trace[:, :, 1] - start_position[:, 1].cpu()).abs().max(0).values
     final_speed_error = torch.stack(world_speed_errors)[-250:].mean(0)
+    final_velocity = torch.stack(velocities)[-250:].mean(0)
     if straight:
         complete = ((dx >= .5 * speed * args.seconds) & (lane_error < .5)
                     & (final_speed_error < .15)) & ~failed
@@ -183,6 +210,10 @@ def main():
         rows.append(dict(trial=i, completed=bool(complete[i]), skating_success=bool(skating_success[i]),
                          failed=bool(failed[i]), numerical_failure=bool(invalid[i]), gates=int(passed[i]),
                          mean_speed_error_mps=value if int(finite_count[i]) else None,
+                         discounted_return=float(discounted_return[i]),
+                         total_return=float(total_return[i]), alive_seconds=float(alive_steps[i])*.02,
+                         max_tilt_deg=float(torch.stack(tilts)[:, i].max()) if not failed[i] else None,
+                         final_5s_forward_speed_mps=float(final_velocity[i, 0]) if not failed[i] else None,
                          forward_displacement_m=float(dx[i]) if torch.isfinite(dx[i]) else None,
                          max_lateral_drift_m=float(lane_error[i]) if torch.isfinite(lane_error[i]) else None,
                          final_5s_speed_error_mps=float(final_speed_error[i]) if torch.isfinite(final_speed_error[i]) else None,
@@ -190,7 +221,7 @@ def main():
                          completion_s=float(finish_time[i]) if torch.isfinite(finish_time[i]) else None))
     result = dict(checkpoint=str(Path(args.ckpt).resolve()), suite=args.suite, seconds=args.seconds,
                   seed=args.seed, mode=ck["task"]["mode"], trials=rows,
-                  target_speed_mps=speed,
+                  target_speed_mps=speed, policy_weights=policy_weights,
                   completion_definition=("no falls; +x displacement >= half target-speed distance; lateral drift <.5m; final 5s mean world velocity error <.15m/s"
                                          if straight else "cross all 3 gate planes forward within .6m of centre, then within .75m of finish at <.12m/s for 2s; no falls"
                                          if args.suite == "course" else "no falls and mean planar velocity error <.25m/s"),
@@ -203,7 +234,7 @@ def main():
                             gates=gates.cpu().numpy(), passed=torch.stack(counts).numpy(),
                             command=torch.stack(cmd_frames).numpy(), suite=np.array(args.suite),
                             failed=failed.cpu().numpy(), terminated=torch.stack(terminated).numpy(),
-                            mode=np.array(ck["task"]["mode"]))
+                            mode=np.array(ck["task"]["mode"] + ":" + policy_weights))
     print(json.dumps(result, indent=2, allow_nan=False))
 
 
