@@ -57,6 +57,12 @@ wm_update = frozen_model_metrics
     return source
 
 
+def freeze_controller(pi):
+    """Preserve decoder weights and the observation scaling they were trained with."""
+    pi.dec.requires_grad_(False)
+    pi.obs_norm.update = lambda x: None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -67,22 +73,32 @@ def main():
     parser.add_argument("--device", choices=["cpu", "cuda:0"], default="cuda:0")
     parser.add_argument("--eager", action="store_true", help="Disable torch.compile for tiny execution checks")
     parser.add_argument("--diagnose", action="store_true", help="Log early actor reward, bootstrap and action ranges")
+    parser.add_argument("--straight_speed", type=float, default=None)
+    parser.add_argument("--freeze_decoder", action="store_true")
     args, training_args = parser.parse_known_args()
+    args.source = str(Path(args.source).resolve())
+    if args.straight_speed is not None and not 0 < args.straight_speed <= .6:
+        parser.error("--straight_speed must be in (0, .6]")
     if args.eager:
         import torch
         torch.compile = lambda fn, **kwargs: fn
     check_upstream()
     from .physics import install_scene, skate_robot
-    from .task import SkateMDP, make_library
+    from .task import SkateMDP, StraightSkateMDP, make_library
     import instanttrack.robot as robot_module
     import instanttrack.mdp as mdp_module
     from instanttrack.motion import MotionLib
     robot = skate_robot()
+    if args.straight_speed is not None:
+        from dataclasses import replace
+        robot = replace(robot, dr=replace(robot.dr, reset_lin_vel=(0., 0., 0.),
+                                         reset_ang_vel=(0., 0., 0.), reset_joint_vel=0.,
+                                         push_interval_s=None))
     install_scene()
     robot_module.get_robot = lambda name: robot if name == "g1" else (_ for _ in ()).throw(ValueError("G1 only"))
-    mdp_module.MDP = SkateMDP
+    mdp_module.MDP = StraightSkateMDP if args.straight_speed is not None else SkateMDP
     MotionLib.from_dir = staticmethod(lambda path, robot, kin, device: make_library(
-        robot, kin, device, count=args.commands, seed=args.command_seed))
+        robot, kin, device, count=args.commands, seed=args.command_seed, straight_speed=args.straight_speed))
     for flag in ("--resume", "--cuda_graph", "--cudagraphs", "--wm_contact", "--wm_ens", "--pi_simba",
                  "--pi_experts", "--ref_residual", "--batch_goal_enc"):
         if flag in training_args:
@@ -90,18 +106,26 @@ def main():
     # Refuse reused output paths even though the upstream trainer would append to them.
     if "--log_dir" not in training_args:
         parser.error("Pass an explicit new --log_dir")
-    log_dir = Path(training_args[training_args.index("--log_dir") + 1])
+    log_index = training_args.index("--log_dir") + 1
+    log_dir = Path(training_args[log_index]).resolve()
+    training_args[log_index] = str(log_dir)
     if log_dir.exists():
         raise FileExistsError(f"Preserving existing run: {log_dir}")
     task = dict(name="directional_blade_skating", command_seed=args.command_seed, commands=args.commands,
+                straight_speed=args.straight_speed, decoder_frozen=args.freeze_decoder,
+                critic_enabled="--no_critic" not in training_args,
                 long_friction=.025, side_friction=1.2, seconds=12,
                 protocol="same pretrained decoder in every mode; policy learns velocity commands on passive blade contacts")
     training_args += ["--wm_only_iters", "0" if args.mode == "frozen_wm" else str(args.wm_warmup)]
     source = training_source((UPSTREAM / "src/instanttrack/train.py").read_text(), args.mode == "frozen_wm", args.diagnose)
     source = patch_once(source, 'dev = "cuda:0"', f'dev = {args.device!r}')
+    def transfer_init(ns):
+        initialize(ns, args.source, args.mode, task)
+        if args.freeze_decoder:
+            freeze_controller(ns["pi"])
     sys.argv = [str(UPSTREAM / "src/instanttrack/train.py"), *training_args]
     g = dict(__name__="__main__", __file__=str(UPSTREAM / "src/instanttrack/train.py"),
-             _task_metadata=task, _transfer_init=lambda ns: initialize(ns, args.source, args.mode, task))
+             _task_metadata=task, _transfer_init=transfer_init)
     exec(compile(source, g["__file__"], "exec"), g)
 
 

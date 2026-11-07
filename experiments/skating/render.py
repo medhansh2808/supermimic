@@ -100,7 +100,7 @@ def main():
                 draw.rectangle((0, 0, 1280, 78), fill=(15, 24, 35))
                 speed = float(np.linalg.norm(s[7:9]))
                 draw.text((18, 10), f"Skating simulation | {mode} | trial {args.trial} | {frame * .02:.1f}s", font=font, fill="white")
-                label = f"Gates {passed}/3" if suite == "course" else ["Forward", "Left turn", "Right turn", "Accelerate then brake"][args.trial]
+                label = ("Straight skating" if suite == "straight" else f"Gates {passed}/3" if suite == "course" else ["Forward", "Left turn", "Right turn", "Accelerate then brake"][args.trial])
                 draw.text((18, 42), f"{label} | speed {speed:.2f} m/s | fixed camera", font=font, fill="white")
                 if "terminated" in data and data["terminated"][frame, args.trial]:
                     draw.rectangle((0, 78, 1280, 110), fill=(125, 20, 20))

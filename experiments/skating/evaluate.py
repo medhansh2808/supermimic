@@ -15,7 +15,7 @@ from instanttrack.kinematics import Kinematics
 from instanttrack.mdp import flatten_state
 import instanttrack.networks as networks
 from .physics import install_scene, skate_robot
-from .task import SkateMDP, make_library
+from .task import SkateMDP, StraightSkateMDP, make_library
 
 
 def make_courses(count, seed):
@@ -50,7 +50,7 @@ def waypoint_commands(p, R, gates, passed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True)
-    parser.add_argument("--suite", choices=["commands", "course"], default="commands")
+    parser.add_argument("--suite", choices=["commands", "course", "straight"], default="commands")
     parser.add_argument("--seconds", type=float, default=30.)
     parser.add_argument("--seed", type=int, default=9200)
     parser.add_argument("--output", required=True)
@@ -66,12 +66,16 @@ def main():
         raise ValueError("Expected a skating checkpoint, not a reaching checkpoint")
     dev = args.device
     networks.AMP_DTYPE = torch.bfloat16 if ck["args"]["amp"] == "bf16" else None
+    speed = ck["task"].get("straight_speed")
+    straight = speed is not None
+    if straight != (args.suite == "straight"):
+        raise ValueError("Straight checkpoints require --suite straight; other checkpoints require their original suites")
     robot = skate_robot()
     install_scene()
     kin = Kinematics(robot, dev)
     n = 4
     motion = make_library(robot, kin, dev, count=n, seed=args.seed, seconds=math.ceil(args.seconds) + 2)
-    mdp = SkateMDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+    mdp = (StraightSkateMDP if straight else SkateMDP)(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     pi = build_policy(ck, mdp, 3, robot, dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
@@ -86,6 +90,11 @@ def main():
     finish_time = torch.full((n,), float("nan"), device=dev)
     commands = torch.tensor([[.5, 0, 0], [.6, 0, .35], [.6, 0, -.35], [.5, 0, 0]], device=dev)
     H = ck["args"]["hist"]
+    if straight:
+        commands[:] = torch.tensor([speed, 0., 0.], device=dev)
+    start_position = env.state()[0].clone()
+    positions = []
+    world_speed_errors = []
     history = None
     errors, glides, support, moving = [], [], [], []
     frames, counts, cmd_frames, terminated = [], [], [], []
@@ -97,7 +106,7 @@ def main():
         else:
             command = commands.clone()
             # Trial 3 must accelerate, then brake and hold still after 5 seconds.
-            if step >= 250:
+            if not straight and step >= 250:
                 command[3] = 0
         motion.commands.copy_(command)
         o = env.observe()
@@ -120,7 +129,11 @@ def main():
         invalid |= ~finite
         failed |= env.failed_eval | ~finite
         last_finite = torch.where((finite & was_alive)[:, None], flat, last_finite)
+        positions.append(S1[0].detach().cpu())
+        world_speed_errors.append((S1[2][:, :2] - command[:, :2]).norm(dim=-1).detach().cpu())
         speed_error, _, _, contact, glide, _ = mdp.components(S1, command)
+        if straight:
+            speed_error = (S1[2][:, :2] - command[:, :2]).square().sum(-1)
         bad_metrics = ~torch.isfinite(speed_error) | ~torch.isfinite(glide)
         invalid |= bad_metrics
         failed |= bad_metrics
@@ -152,6 +165,13 @@ def main():
     glide_mean = (glide * moving_mask).sum(0) / moving_mask.sum(0).clamp(min=1)
     if args.suite == "commands":
         complete = (~failed) & (mean_error < .25)
+    position_trace = torch.stack(positions)
+    dx = position_trace[-1, :, 0] - start_position[:, 0].cpu()
+    lane_error = (position_trace[:, :, 1] - start_position[:, 1].cpu()).abs().max(0).values
+    final_speed_error = torch.stack(world_speed_errors)[-250:].mean(0)
+    if straight:
+        complete = ((dx >= .5 * speed * args.seconds) & (lane_error < .5)
+                    & (final_speed_error < .15)).to(dev) & ~failed
     complete &= ~failed
     # Course completion alone can be achieved by awkward hopping: expose and gate gliding separately.
     skating_success = complete & (glide_mean > .15) & ~failed
@@ -161,11 +181,16 @@ def main():
         rows.append(dict(trial=i, completed=bool(complete[i]), skating_success=bool(skating_success[i]),
                          failed=bool(failed[i]), numerical_failure=bool(invalid[i]), gates=int(passed[i]),
                          mean_speed_error_mps=value if int(finite_count[i]) else None,
+                         forward_displacement_m=float(dx[i]) if torch.isfinite(dx[i]) else None,
+                         max_lateral_drift_m=float(lane_error[i]) if torch.isfinite(lane_error[i]) else None,
+                         final_5s_speed_error_mps=float(final_speed_error[i]) if torch.isfinite(final_speed_error[i]) else None,
                          glide_score=float(glide_mean[i]), support=float(contacts[:, i].mean()),
                          completion_s=float(finish_time[i]) if torch.isfinite(finish_time[i]) else None))
     result = dict(checkpoint=str(Path(args.ckpt).resolve()), suite=args.suite, seconds=args.seconds,
                   seed=args.seed, mode=ck["task"]["mode"], trials=rows,
-                  completion_definition=("cross all 3 gate planes forward within .6m of centre, then within .75m of finish at <.12m/s for 2s; no falls"
+                  target_speed_mps=speed,
+                  completion_definition=("no falls; +x displacement >= half target-speed distance; lateral drift <.5m; final 5s mean world velocity error <.15m/s"
+                                         if straight else "cross all 3 gate planes forward within .6m of centre, then within .75m of finish at <.12m/s for 2s; no falls"
                                          if args.suite == "course" else "no falls and mean planar velocity error <.25m/s"),
                   note="Glide score is a heuristic; inspect the skating gait visually. This is simplified blade-contact physics.")
     path = Path(args.output)

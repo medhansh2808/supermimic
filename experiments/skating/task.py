@@ -23,12 +23,17 @@ def sample_commands(count, seed):
     return commands
 
 
-def make_library(robot, kin, device, count=128, seed=2100, seconds=12):
+def make_library(robot, kin, device, count=128, seed=2100, seconds=12, straight_speed=None):
     motion = standing_library(robot, kin, device, count=count, seed=seed, seconds=seconds)
     dz = ANKLE_HEIGHT - .035
     motion.root_p[:, 2] += dz
     motion.body_p[:, :, 2] += dz
     motion.commands = torch.as_tensor(sample_commands(count, seed), device=device)
+    if straight_speed is not None:
+        if not 0 < straight_speed <= .6:
+            raise ValueError("Straight speed must be in (0, .6] m/s")
+        motion.commands.zero_()
+        motion.commands[:, 0] = straight_speed
     motion.goal = types.MethodType(lambda self, f, K: self.commands[self.clip_id[f]], motion)
     motion.names = [f"command_{i:04d}" for i in range(count)]
     return motion
@@ -114,3 +119,27 @@ class SkateMDP(MDP):
         body = torch.zeros((*p.shape[:-1], len(self.kin.tracked_idx) * 3), device=p.device, dtype=p.dtype)
         upright = mat_to_6d(R.transpose(-1, -2) @ yaw_mat(R))
         return torch.cat((invariant_features(S), self.default_q - q, body, root, upright, xi), -1)
+
+
+class StraightSkateMDP(SkateMDP):
+    """One world +x velocity target; bounded balance/heading reward, no course."""
+    def obs(self, S, a_prev, xi, f):
+        obs = super().obs(S, a_prev, xi, f)
+        # A straight world +x task needs heading feedback, unlike yaw-invariant turns.
+        return torch.cat((obs[..., :-6], mat_to_6d(S[1].transpose(-1, -2))), -1)
+
+    def reward_command(self, S, command, a, a_prev):
+        p, R, v, w, q, qd = S
+        speed_error = (v[..., :2] - command[..., :2]).square().sum(-1)
+        tilt = (1 - R[..., 2, 2]).clamp(min=0)
+        heading = (1 - R[..., 0, 0]).clamp(min=0)
+        height = (p[..., 2] - self.motion.root_p[0, 2]).square()
+        pose = (q - self.default_q).square().mean(-1)
+        smooth = (a - a_prev).square().mean(-1)
+        # Maximum step reward remains 5 * CONTROL_DT = .1, as in the trainer.
+        return CONTROL_DT * (2 * torch.exp(-speed_error / .20**2)
+                             + torch.exp(-tilt / .12)
+                             + .5 * torch.exp(-height / .12**2)
+                             + .5 * torch.exp(-pose / .60**2)
+                             + .5 * torch.exp(-heading / .12)
+                             + .5 * torch.exp(-smooth / .5**2))
