@@ -10,8 +10,34 @@ from experiments.wm_control.common import UPSTREAM, check_upstream
 from experiments.wm_control.train_reach import adapt_source, initialize, patch_once
 
 
-def training_source(source, frozen):
+def training_source(source, frozen, diagnose=False):
     source = adapt_source(source, False)
+    # Match simulator collection and evaluation: the model must see executed actions.
+    source = patch_once(source, "    S1, _, heads = wm.step_full(S, a, a_prev, xi_n)",
+                        "    a = a.clamp(-20, 20)\n    S1, _, heads = wm.step_full(S, a, a_prev, xi_n)")
+    source = patch_once(source, "nn.utils.clip_grad_norm_(critic.parameters(), 1.0)",
+                        "nn.utils.clip_grad_norm_(critic.parameters(), 1.0, error_if_nonfinite=True)")
+    source = patch_once(source, "gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)",
+                        "gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0, error_if_nonfinite=True)")
+    if diagnose:
+        diagnostic = """
+    global _skate_update_count
+    _skate_update_count = globals().get('_skate_update_count', 0) + 1
+    if _skate_update_count <= 10 or _skate_update_count % 50 == 0:
+        with torch.no_grad():
+            reward_part = (disc * c_t * r).sum(0)
+            acts = flat(As)
+            fields = dict(update=_skate_update_count,
+                          action_absmax=float(acts.abs().max()),
+                          action_clip_fraction=float((acts.abs() >= 20).float().mean()),
+                          reward_min=float(r.min()), reward_max=float(r.max()),
+                          reward_return_mean=float(reward_part.mean()),
+                          bootstrap_mean=float((J - reward_part).mean()),
+                          bootstrap_absmax=float((J - reward_part).abs().max()),
+                          imagined_joint_speed_absmax=float(S_all[5].abs().max()))
+            print('[skate-diagnostic] ' + str(fields), flush=True)
+"""
+        source = patch_once(source, "    loss = -J.mean()", diagnostic + "    loss = -J.mean()")
     # Abort numerical failures rather than silently corrupting a full overnight run.
     source = patch_once(source, "nn.utils.clip_grad_norm_(wm.parameters(), 1.0)",
                         "nn.utils.clip_grad_norm_(wm.parameters(), 1.0, error_if_nonfinite=True)")
@@ -40,6 +66,7 @@ def main():
     parser.add_argument("--wm_warmup", type=int, default=1000)
     parser.add_argument("--device", choices=["cpu", "cuda:0"], default="cuda:0")
     parser.add_argument("--eager", action="store_true", help="Disable torch.compile for tiny execution checks")
+    parser.add_argument("--diagnose", action="store_true", help="Log early actor reward, bootstrap and action ranges")
     args, training_args = parser.parse_known_args()
     if args.eager:
         import torch
@@ -70,7 +97,7 @@ def main():
                 long_friction=.025, side_friction=1.2, seconds=12,
                 protocol="same pretrained decoder in every mode; policy learns velocity commands on passive blade contacts")
     training_args += ["--wm_only_iters", "0" if args.mode == "frozen_wm" else str(args.wm_warmup)]
-    source = training_source((UPSTREAM / "src/instanttrack/train.py").read_text(), args.mode == "frozen_wm")
+    source = training_source((UPSTREAM / "src/instanttrack/train.py").read_text(), args.mode == "frozen_wm", args.diagnose)
     source = patch_once(source, 'dev = "cuda:0"', f'dev = {args.device!r}')
     sys.argv = [str(UPSTREAM / "src/instanttrack/train.py"), *training_args]
     g = dict(__name__="__main__", __file__=str(UPSTREAM / "src/instanttrack/train.py"),
