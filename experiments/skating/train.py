@@ -75,7 +75,15 @@ def main():
     parser.add_argument("--diagnose", action="store_true", help="Log early actor reward, bootstrap and action ranges")
     parser.add_argument("--straight_speed", type=float, default=None)
     parser.add_argument("--freeze_decoder", action="store_true")
+    parser.add_argument("--stable_critic", action="store_true")
+    parser.add_argument("--critic_warmup_updates", type=int, default=200)
+    parser.add_argument("--critic_target_tau", type=float, default=.01)
     args, training_args = parser.parse_known_args()
+    if args.stable_critic:
+        if args.straight_speed is None or "--no_critic" in training_args:
+            parser.error("--stable_critic requires --straight_speed and an enabled critic")
+        if args.critic_warmup_updates < 1 or not 0 < args.critic_target_tau <= 1:
+            parser.error("Invalid critic warmup or target tau")
     args.source = str(Path(args.source).resolve())
     if args.straight_speed is not None and not 0 < args.straight_speed <= .6:
         parser.error("--straight_speed must be in (0, .6]")
@@ -114,10 +122,16 @@ def main():
     task = dict(name="directional_blade_skating", command_seed=args.command_seed, commands=args.commands,
                 straight_speed=args.straight_speed, decoder_frozen=args.freeze_decoder,
                 critic_enabled="--no_critic" not in training_args,
+                critic_protocol="lagged_target_fixed_normalization" if args.stable_critic else "upstream",
+                critic_warmup_updates=args.critic_warmup_updates if args.stable_critic else 0,
+                critic_target_tau=args.critic_target_tau if args.stable_critic else None,
                 long_friction=.025, side_friction=1.2, seconds=12,
                 protocol="same pretrained decoder in every mode; policy learns velocity commands on passive blade contacts")
     training_args += ["--wm_only_iters", "0" if args.mode == "frozen_wm" else str(args.wm_warmup)]
     source = training_source((UPSTREAM / "src/instanttrack/train.py").read_text(), args.mode == "frozen_wm", args.diagnose)
+    if args.stable_critic:
+        from .actor_critic import patch_actor_critic
+        source = patch_actor_critic(source, patch_once)
     source = patch_once(source, 'dev = "cuda:0"', f'dev = {args.device!r}')
     def transfer_init(ns):
         initialize(ns, args.source, args.mode, task)
@@ -125,7 +139,8 @@ def main():
             freeze_controller(ns["pi"])
     sys.argv = [str(UPSTREAM / "src/instanttrack/train.py"), *training_args]
     g = dict(__name__="__main__", __file__=str(UPSTREAM / "src/instanttrack/train.py"),
-             _task_metadata=task, _transfer_init=transfer_init)
+             _task_metadata=task, _transfer_init=transfer_init,
+             _critic_config=dict(warmup_updates=args.critic_warmup_updates, tau=args.critic_target_tau))
     exec(compile(source, g["__file__"], "exec"), g)
 
 

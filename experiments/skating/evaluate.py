@@ -158,6 +158,8 @@ def main():
             env.reset(ids, motion.clip_start[ids])
             env.failed_eval[ids] = True
         env.f = torch.minimum(env.f, motion.clip_end - 1)
+    # Traces are collected on CPU; aggregate outcomes on CPU for every suite.
+    failed, invalid, complete = (value.detach().cpu() for value in (failed, invalid, complete))
     err, glide, contacts = torch.stack(errors), torch.stack(glides), torch.stack(support)
     finite_count = torch.isfinite(err).sum(0)
     mean_error = torch.nan_to_num(err, nan=0., posinf=0., neginf=0.).sum(0) / finite_count.clamp(min=1)
@@ -171,7 +173,7 @@ def main():
     final_speed_error = torch.stack(world_speed_errors)[-250:].mean(0)
     if straight:
         complete = ((dx >= .5 * speed * args.seconds) & (lane_error < .5)
-                    & (final_speed_error < .15)).to(dev) & ~failed
+                    & (final_speed_error < .15)) & ~failed
     complete &= ~failed
     # Course completion alone can be achieved by awkward hopping: expose and gate gliding separately.
     skating_success = complete & (glide_mean > .15) & ~failed
