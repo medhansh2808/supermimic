@@ -13,11 +13,12 @@ from experiments.wm_control.common import build_policy, check_upstream, load_che
 from instanttrack.dr import XiLayout
 from instanttrack.env import TrackingSim, make_sim
 from instanttrack.kinematics import Kinematics
-from instanttrack.mdp import MAX_STEP_REWARD, MDP, flatten_state
+from instanttrack.mdp import flatten_state, unflatten_state
 from instanttrack.motion import MotionLib
 import instanttrack.networks as networks
 from instanttrack.rotations import mat_to_quat, yaw_mat, mv3
 from .physics import ANKLE_HEIGHT, install_scene, skate_robot
+from .gait_adaptation import SkateMotionMDP
 
 
 def rank_walk_clips(motion, pattern: str, limit: int):
@@ -99,11 +100,17 @@ def run_clip(env, pi, motion, clip_id: int, seconds: float, hist_len: int, goal_
     q = state[:, 13:42]
     ref_q = motion.q[ref_frames].cpu()
     root_xy_error = (root_p[:, :2] - ref_p[:, :2]).norm(dim=-1)
+    state_gpu = tuple(value.to(dev) for value in unflatten_state(state.to(dev)))
+    blade_contact, blade_velocity, glide = env.mdp.skate_components(state_gpu)
+    blade_contact = blade_contact.cpu()
+    blade_velocity = blade_velocity.cpu()
+    glide = glide.cpu()
+    contact_mass = blade_contact.sum().clamp(min=1e-6)
     alive_s = len(state) * .02
     return dict(
         clip=motion.names[clip_id], duration_s=alive_s,
         failed=fail_step is not None, failure_time_s=None if fail_step is None else fail_step * .02,
-        normalized_tracking_return=float(sum(rewards) / max(len(rewards) * MAX_STEP_REWARD, 1e-8)),
+        normalized_tracking_return=float(sum(rewards) / max(len(rewards) * env.mdp.max_step_reward, 1e-8)),
         reference_path_m=float((ref_p[-1, :2] - ref_p[0, :2]).norm().item()),
         robot_path_m=float((root_p[-1, :2] - root_p[0, :2]).norm().item()),
         mean_reference_speed_mps=float(ref_v[:, :2].norm(dim=-1).mean().item()),
@@ -113,6 +120,10 @@ def run_clip(env, pi, motion, clip_id: int, seconds: float, hist_len: int, goal_
         root_xy_rmse_m=float(root_xy_error.square().mean().sqrt().item()),
         joint_rmse_rad=float((q - ref_q).square().mean().sqrt().item()),
         max_tilt_deg=float(torch.rad2deg(torch.acos(tilt_cos)).max().item()),
+        mean_blade_contact=float(blade_contact.mean().item()),
+        mean_supported_blade_axis_speed_mps=float((blade_contact * blade_velocity[..., 0].abs()).sum().item() / contact_mass.item()),
+        mean_supported_lateral_blade_speed_mps=float((blade_contact * blade_velocity[..., 1].abs()).sum().item() / contact_mass.item()),
+        mean_glide_score=float(glide.mean().item()),
         reference_straightness=float(
             (ref_p[-1, :2] - ref_p[0, :2]).norm().item()
             / max(float((ref_p[1:, :2] - ref_p[:-1, :2]).norm(dim=-1).sum().item()), 1e-8)
@@ -137,8 +148,9 @@ def main():
     torch.manual_seed(0)
     dev = args.device
     ck = load_checkpoint(args.ckpt, device=dev)
-    if "task" in ck:
-        raise ValueError("Use the original full motion-tracking checkpoint, not a skating-transfer checkpoint")
+    task = ck.get("task")
+    if task and task.get("name") != "skate_motion_adaptation":
+        raise ValueError("Expected the original motion checkpoint or a skate-motion-adaptation checkpoint")
     networks.AMP_DTYPE = torch.bfloat16 if ck["args"].get("amp", "none") == "bf16" else None
     robot = skate_robot()
     # Put the skating blade on the floor while preserving the full reference gait.
@@ -151,8 +163,11 @@ def main():
     if not selected:
         names = ", ".join(motion.names)
         raise ValueError(f"No clips match {args.clip_regex!r}; available clip names: {names}")
-    mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev),
-              XiLayout(robot, dev).dim, robot.sensing)
+    glide_weight = float(task.get("glide_weight", 1.0)) if task else 1.0
+    policy_label = "skate_adapted_policy" if task else "pretrained_policy"
+    mdp = SkateMotionMDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev),
+                         XiLayout(robot, dev).dim, robot.sensing, glide_weight=glide_weight)
+    mdp.max_step_reward = (5. + glide_weight) * .02
     pi = build_policy(ck, mdp, motion.goal_dim(ck["args"]["goal_frames"]), robot, dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
@@ -169,17 +184,22 @@ def main():
         stem = f"motion_{rank:02d}_{re.sub(r'[^A-Za-z0-9_-]+', '_', candidate['name'])}"
         np.savez_compressed(out / f"{stem}.npz", state=state[:, None, :],
                             passed=np.zeros((len(state), 1), dtype=np.int64),
-                            suite=np.array("motion"), mode=np.array("pretrained_policy"),
+                            suite=np.array("motion"), mode=np.array(policy_label),
                             trial_name=np.array([candidate["name"]]),
                             terminated=failed[:, None])
         result["video_data"] = f"{stem}.npz"
         result["reference_selection"] = candidate
         results.append(result)
         print(json.dumps(result, indent=2), flush=True)
-    report = dict(checkpoint=str(Path(args.ckpt).resolve()), suite="pretrained motion tracking on skate asset",
-                  trained=False, randomized=False, seconds=args.seconds, clip_regex=args.clip_regex,
+    trained_policy = bool(task)
+    note = ("This is a fine-tuned locomotion policy evaluated on simplified directional blade contacts; its tracking reference is walking, so inspect the videos before describing its style as skating."
+            if trained_policy else
+            "No policy training. This original tracking controller follows a walking reference on simplified directional blade contacts.")
+    report = dict(checkpoint=str(Path(args.ckpt).resolve()), suite="motion tracking with skate contacts",
+                  trained=bool(task), randomized=False, seconds=args.seconds, clip_regex=args.clip_regex,
+                  glide_reward_weight=glide_weight,
                   candidate_motions=candidates, selected_results=results,
-                  note="No policy training. A tracking clip on simplified directional blade contacts is a gait feasibility check, not proof of learned skating.")
+                  note=note)
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(out / "report.json")
 
