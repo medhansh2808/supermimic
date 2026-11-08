@@ -55,6 +55,7 @@ class Runner:
         origin = env.state()[0].clone()
         failed = torch.zeros(n, dtype=torch.bool, device=dev)
         scores = torch.zeros(n, device=dev); speed_sum = scores.clone(); alive_count = scores.clone()
+        model_return = scores.clone()
         max_tilt = scores.clone(); max_drift = scores.clone(); displacement = scores.clone()
         history = None; frames, flags = [], []
         display = flatten_state(env.state()).clone()
@@ -79,6 +80,7 @@ class Runner:
             if not torch.isfinite(action).all():
                 raise FloatingPointError('Nonfinite action; preserving previous checkpoints')
             active = ~failed
+            previous_action = env.a_prev.clone()
             env.step(action)
             S = env.state(); flat = flatten_state(S)
             if not torch.isfinite(flat).all():
@@ -94,13 +96,18 @@ class Runner:
             reward = (v[:,0]/self.target).clamp(-1,1) + .3*track - .3*(v[:,1]/.3).square().clamp(max=4) - .3*tilt.square() - .01*residual.square().mean(-1)
             scores += torch.where(alive, reward, 0.)/steps
             scores -= newly.float() * (2. + (steps-t)/steps)
+            # Same running reward/discount/failure cost as glide_model_study.
+            model_reward = .02*((v[:,0]/self.target).clamp(-1,1) + .3*track
+                - .3*(v[:,1]/.3).square().clamp(max=4) - .3*tilt.square()
+                - .01*(action-previous_action).square().mean(-1)) - 2.*newly.float()
+            model_return += .99**t * torch.where(active, model_reward, 0.)
             speed_sum += torch.where(alive,v[:,0],0.); alive_count += alive
             displacement = torch.where(active,p[:,0]-origin[:,0],displacement)
             max_tilt = torch.maximum(max_tilt, torch.where(active,tilt,0.))
             max_drift = torch.maximum(max_drift, torch.where(active,drift,0.))
             display = torch.where(active[:,None],flat,display)
             env.f = torch.minimum(env.f,self.ends)
-        rows = [dict(failed=bool(failed[i]), mean_forward_speed_mps=float(speed_sum[i]/steps),
+        rows = [dict(failed=bool(failed[i]), model_discounted_return=float(model_return[i]), mean_forward_speed_mps=float(speed_sum[i]/steps),
                      forward_displacement_m=float(displacement[i]), max_tilt_deg=float(torch.rad2deg(max_tilt[i])),
                      max_lateral_drift_m=float(max_drift[i]), score=float(scores[i])) for i in range(n)]
         return scores, rows, (frames,flags)
